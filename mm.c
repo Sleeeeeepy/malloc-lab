@@ -83,6 +83,7 @@ static void *coalesce(void *bp);
 static void *find_fit(size_t asize);
 static void *first_fit(size_t asize);
 static void *next_fit(size_t asize);
+static void *best_fit(size_t asize);
 static void place(void *bp, size_t asize);
 static void set_next_fit_ptr(void *bp);
 
@@ -307,6 +308,26 @@ static void *next_fit(size_t asize) {
     return NULL;
 }
 
+static void *best_fit(size_t asize) {
+    void *found = NULL;
+    size_t diff = 0;
+    for (unsigned char *cursor = heap_listp; GET_SIZE(HDRP(cursor)) > 0; cursor = NEXT_BLKP(cursor)) {
+        if (!GET_ALLOC(HDRP(cursor)) && (asize <= GET_SIZE(HDRP(cursor)))) {
+            if (found == NULL) {
+                found = cursor;
+                diff = GET_SIZE(HDRP(cursor)) - asize;
+                continue;
+            }
+            
+            if (diff > GET_SIZE(HDRP(cursor)) - asize) {
+                found = cursor;
+                diff = GET_SIZE(HDRP(cursor)) - asize;
+            }
+        }
+    }
+
+    return found;
+}
 
 static void place(void *bp, size_t asize)
 {
