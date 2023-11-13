@@ -114,6 +114,9 @@ int mm_init(void)
     PUT(heap_listp + (3 * WSIZE), PACK(0, ALLOC_BLK));
     heap_listp += (2 * WSIZE);
 
+    free_list_head = NULL;
+    free_list_tail = NULL;
+
     if (extend_heap(CHUNKSIZE/WSIZE) == NULL) {
         return -1;
     }
