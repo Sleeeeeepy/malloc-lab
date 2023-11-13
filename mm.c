@@ -83,6 +83,7 @@ static void *coalesce(void *bp);
 static void *find_fit(size_t asize);
 static void *first_fit(size_t asize);
 static void place(void *bp, size_t asize);
+static size_t adjust_block_size(size_t size); 
 static void attach_free_list(void *bp);
 static void detach_free_list(void *bp);
 /* Heap list */
@@ -136,12 +137,7 @@ void *mm_malloc(size_t size) {
         return NULL;
     }
 
-    /* Adjusted block size to include overhead and alignment reqs. */
-    if (size <= DSIZE) {
-        asize = 2 * DSIZE;
-    } else {
-        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
-    }
+    asize = adjust_block_size(size);
 
     /* Search the free list for a fit */
     if ((bp = find_fit(asize)) != NULL) {
@@ -310,4 +306,15 @@ static void detach_free_list(void *bp) {
             SUCC(PRED(bp)) = NULL;
         }
     }
+}
+
+/* Adjusted block size to include overhead and alignment reqs. */
+static size_t adjust_block_size(size_t size) {
+    if (size <= DSIZE) {
+        size = 2 * DSIZE;
+    } else {
+        size = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    }
+
+    return size;
 }
