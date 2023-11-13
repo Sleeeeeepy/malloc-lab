@@ -296,14 +296,10 @@ static void attach_free_list(void* bp) {
         return;
     }
 
-    // PRED(free_list_head) = bp;
-    // SUCC(bp) = free_list_head;
-    // PRED(bp) = NULL;
-    // free_list_head = bp;
-    SUCC(free_list_tail) = bp;
-    PRED(bp) = free_list_tail;
-    SUCC(bp) = NULL;
-    free_list_tail = bp;
+    PRED(free_list_head) = bp;
+    SUCC(bp) = free_list_head;
+    PRED(bp) = NULL;
+    free_list_head = bp;
 }
 
 static void detach_free_list(void* bp) {
