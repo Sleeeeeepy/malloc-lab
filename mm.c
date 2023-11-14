@@ -44,9 +44,10 @@ team_t team = {
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
 /* Basic constants and macros */
-#define WSIZE     sizeof(void *) /* Word and header/footer size (bytes) */
-#define DSIZE     (2 * WSIZE)    /* Double word size (bytes) */
-#define CHUNKSIZE (1 << 12)      /* Extend heap by this amount (bytes) */
+#define WSIZE        sizeof(void *) /* Word and header/footer size (bytes) */
+#define DSIZE        (2 * WSIZE)    /* Double word size (bytes) */
+#define CHUNKSIZE    (1 << 12)      /* Extend heap by this amount (bytes) */
+#define SEG_LIST_LEN 20             /* length of segregated list */
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) > (y) ? (y) : (x))
@@ -78,22 +79,17 @@ team_t team = {
 typedef enum { ZERO_BLK = 0, FREE_BLK = 0, ALLOC_BLK = 1 } block_status_t;
 
 /* Declarations */
-static void *extend_heap(size_t words);
-static void *coalesce(void *bp);
-static void *find_fit(size_t asize);
-static void *first_fit(size_t asize);
 static void place(void *bp, size_t asize);
-static void attach_free_list(void *bp);
-static void detach_free_list(void *bp);
+static void *find_fit(size_t asize);
+static void *extend_heap(size_t);
+static void *coalesce(void *);
+static void *attach_free_list(void *bp, size_t asize);
+static void *detach_free_list(void *bp);
+static size_t asize_to_index(size_t asize);
+
 /* Heap list */
 static void *heap_listp = NULL;
-
-/* Free list */
-static void *free_list_head = NULL;
-static void *free_list_tail = NULL;
-
-/* Memory allocation strategy */
-static void *(*malloc_strategy)(size_t asize);
+static void *free_listp[SEG_LIST_LEN] = {NULL};
 
 /*
  * mm_init - initialize the malloc package.
@@ -110,15 +106,14 @@ int mm_init(void) {
     PUT(heap_listp + (3 * WSIZE), PACK(0, ALLOC_BLK));
     heap_listp += (2 * WSIZE);
 
-    free_list_head = NULL;
-    free_list_tail = NULL;
+    for (size_t i = 0; i < SEG_LIST_LEN; i++) {
+        free_listp[i] = NULL;
+    }
 
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL) {
         return -1;
     }
-
-    /* Select memory allocation strategy */
-    malloc_strategy = first_fit;
+    
     return 0;
 }
 
@@ -127,8 +122,8 @@ int mm_init(void) {
  *     Always allocate a block whose size is a multiple of the alignment.
  */
 void *mm_malloc(size_t size) {
-    size_t asize;      /* Adjusted block size */
-    size_t extendsize; /* Amount to extend heap if no fit */
+    size_t asize;       /* Adjusted block size */
+    size_t extend_size; /* Amount to extend heap if no fit */
     unsigned char *bp;
 
     /* Ignore spurious reqeusts */
@@ -140,7 +135,7 @@ void *mm_malloc(size_t size) {
     if (size <= DSIZE) {
         asize = 2 * DSIZE;
     } else {
-        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+        asize = DSIZE * ((size + DSIZE + DSIZE - 1) / DSIZE);
     }
 
     /* Search the free list for a fit */
@@ -150,8 +145,8 @@ void *mm_malloc(size_t size) {
     }
 
     /* No fit found. Get more memory and place the block */
-    extendsize = MAX(asize, CHUNKSIZE);
-    if ((bp = extend_heap(extendsize / WSIZE)) == NULL) {
+    extend_size = MAX(asize, CHUNKSIZE);
+    if ((bp = extend_heap(extend_size / WSIZE)) == NULL) {
         return NULL;
     }
     place(bp, asize);
@@ -167,6 +162,36 @@ void mm_free(void *ptr) {
     PUT(HDRP(ptr), PACK(size, FREE_BLK));
     PUT(FTRP(ptr), PACK(size, FREE_BLK));
     coalesce(ptr);
+}
+
+static void *coalesce(void *ptr) {
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr)));
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
+    size_t size = GET_SIZE(HDRP(ptr));
+
+    // Update free list and header, footer
+    if (prev_alloc && !next_alloc) {
+        detach_free_list(NEXT_BLKP(ptr));
+        size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+        PUT(HDRP(ptr), PACK(size, FREE_BLK));
+        PUT(FTRP(ptr), PACK(size, FREE_BLK));
+    } else if (!prev_alloc && next_alloc) {
+        detach_free_list(PREV_BLKP(ptr));
+        size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
+        PUT(FTRP(ptr), PACK(size, FREE_BLK));
+        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, FREE_BLK));
+        ptr = PREV_BLKP(ptr);
+    } else if (!prev_alloc && !next_alloc) {
+        detach_free_list(PREV_BLKP(ptr));
+        detach_free_list(NEXT_BLKP(ptr));
+        size += GET_SIZE(HDRP(PREV_BLKP(ptr))) + GET_SIZE(FTRP(NEXT_BLKP(ptr)));
+        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, FREE_BLK));
+        PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, FREE_BLK));
+        ptr = PREV_BLKP(ptr);
+    }
+
+    attach_free_list(ptr, size);
+    return ptr;
 }
 
 /*
@@ -187,8 +212,11 @@ void *mm_realloc(void *ptr, size_t size) {
     return newptr;
 }
 
+/*
+ * extend_heap - Extend the heap by allocating a new free block.
+ */
 static void *extend_heap(size_t words) {
-    unsigned char *bp;
+    char *bp;
     size_t size;
 
     /* Allocate an even number of words to maintain alignment */
@@ -206,54 +234,20 @@ static void *extend_heap(size_t words) {
     return coalesce(bp);
 }
 
-static void *coalesce(void *bp) {
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
-    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
-    size_t size = GET_SIZE(HDRP(bp));
+static void *find_fit(size_t asize) {
+    size_t start_index = asize_to_index(asize);
+    for (size_t i = start_index; i < SEG_LIST_LEN; i++) {
+        if (free_listp[i] == NULL) {
+            continue;
+        }
 
-    if (prev_alloc && next_alloc) {
-        attach_free_list(bp);
-        return bp;
-    }
-
-    if (prev_alloc && !next_alloc) {
-        detach_free_list(NEXT_BLKP(bp));
-        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        PUT(HDRP(bp), PACK(size, FREE_BLK));
-        PUT(FTRP(bp), PACK(size, FREE_BLK));
-        attach_free_list(bp);
-        return bp;
-    }
-
-    if (!prev_alloc && next_alloc) {
-        detach_free_list(PREV_BLKP(bp));
-        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-        PUT(FTRP(bp), PACK(size, FREE_BLK));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, FREE_BLK));
-        bp = PREV_BLKP(bp);
-        attach_free_list(bp);
-        return bp;
-    }
-
-    detach_free_list(PREV_BLKP(bp));
-    detach_free_list(NEXT_BLKP(bp));
-    size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
-    PUT(HDRP(PREV_BLKP(bp)), PACK(size, FREE_BLK));
-    PUT(FTRP(NEXT_BLKP(bp)), PACK(size, FREE_BLK));
-    bp = PREV_BLKP(bp);
-    attach_free_list(bp);
-    return bp;
-}
-
-static void *find_fit(size_t asize) { return malloc_strategy(asize); }
-
-static void *first_fit(size_t asize) {
-    for (unsigned char *cursor = free_list_head; cursor != NULL;
-         cursor = SUCC(cursor)) {
-        if (asize <= GET_SIZE(HDRP(cursor))) {
-            return cursor;
+        for (void *bp = free_listp[i]; bp != NULL; bp = SUCC(bp)) {
+            if (GET_SIZE(HDRP(bp)) >= asize) {
+                return bp;
+            }
         }
     }
+
     return NULL;
 }
 
@@ -266,48 +260,69 @@ static void place(void *bp, size_t asize) {
         bp = NEXT_BLKP(bp);
         PUT(HDRP(bp), PACK(csize - asize, FREE_BLK));
         PUT(FTRP(bp), PACK(csize - asize, FREE_BLK));
-        attach_free_list(bp);
-        return;
+        coalesce(bp);
+    } else {
+        PUT(HDRP(bp), PACK(csize, ALLOC_BLK));
+        PUT(FTRP(bp), PACK(csize, ALLOC_BLK));
     }
-
-    PUT(HDRP(bp), PACK(csize, ALLOC_BLK));
-    PUT(FTRP(bp), PACK(csize, ALLOC_BLK));
 }
 
-static void attach_free_list(void *bp) {
-    if (free_list_tail == NULL || free_list_head == NULL) {
-        free_list_head = bp;
-        free_list_tail = bp;
+static void *attach_free_list(void *bp, size_t asize) {
+    size_t index = asize_to_index(asize);
+    if (free_listp[index] == NULL) {
+        free_listp[index] = bp;
         PRED(bp) = 0;
         SUCC(bp) = 0;
-        return;
+        return bp;
     }
 
-    PRED(free_list_head) = bp;
-    SUCC(bp) = free_list_head;
+    PRED(free_listp[index]) = bp;
+    SUCC(bp) = free_listp[index];
     PRED(bp) = NULL;
-    free_list_head = bp;
+    free_listp[index] = bp;
+    return bp;
 }
 
-static void detach_free_list(void *bp) {
-    if (bp != free_list_head && bp != free_list_tail) {
-        SUCC(PRED(bp)) = SUCC(bp);
-        PRED(SUCC(bp)) = PRED(bp);
+static void *detach_free_list(void *bp) {
+    size_t index = asize_to_index(GET_SIZE(HDRP(bp)));
+    if (bp != free_listp[index]) {
+        if (PRED(bp) != NULL) {
+            SUCC(PRED(bp)) = SUCC(bp);
+        }
 
-        return;
+        if (SUCC(bp) != NULL) {
+            PRED(SUCC(bp)) = PRED(bp);
+        }
+        return bp;
     }
 
-    if (bp == free_list_head) {
-        free_list_head = SUCC(bp);
-        if (free_list_head != NULL) {
+    if (bp == free_listp[index]) {
+        free_listp[index] = SUCC(bp);
+        if (free_listp[index] != NULL) {
             PRED(SUCC(bp)) = NULL;
         }
+        return bp;
     }
 
-    if (bp == free_list_tail) {
-        free_list_tail = PRED(bp);
-        if (free_list_tail != NULL) {
-            SUCC(PRED(bp)) = NULL;
-        }
+    return bp;
+}
+
+static size_t asize_to_index(size_t asize) {
+    size_t power = 1;
+    size_t index = 0;
+
+    if (asize == 0) {
+        return 0;
     }
+
+    while (power <= asize) {
+        power <<= 1;
+        index += 1;
+    }
+
+    if (index >= SEG_LIST_LEN) {
+        return SEG_LIST_LEN - 1;
+    }
+
+    return index;
 }
