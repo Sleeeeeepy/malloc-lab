@@ -46,7 +46,7 @@ team_t team = {
 /* Basic constants and macros */
 #define WSIZE        sizeof(void *) /* Word and header/footer size (bytes) */
 #define DSIZE        (2 * WSIZE)    /* Double word size (bytes) */
-#define CHUNKSIZE    (1 << 12)      /* Extend heap by this amount (bytes) */
+#define CHUNKSIZE    (1 << 9)      /* Extend heap by this amount (bytes) */
 #define SEG_LIST_LEN 20             /* length of segregated list */
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -79,13 +79,14 @@ team_t team = {
 typedef enum { ZERO_BLK = 0, FREE_BLK = 0, ALLOC_BLK = 1 } block_status_t;
 
 /* Declarations */
-static void place(void *bp, size_t asize);
-static void *find_fit(size_t asize);
+static void place(void *, size_t);
+static void *find_fit(size_t);
 static void *extend_heap(size_t);
 static void *coalesce(void *);
-static void *attach_free_list(void *bp, size_t asize);
-static void *detach_free_list(void *bp);
-static size_t asize_to_index(size_t asize);
+static void *attach_free_list(void *, size_t);
+static void *detach_free_list(void *);
+static size_t asize_to_index(size_t);
+static size_t adjust_size(size_t);
 
 /* Heap list */
 static void *heap_listp = NULL;
@@ -198,6 +199,101 @@ static void *coalesce(void *ptr) {
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
 void *mm_realloc(void *ptr, size_t size) {
+    if (ptr == NULL) {
+        return mm_malloc(size);
+    }
+
+    if (size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+    
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr)));
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
+    size_t alloc_size = GET_SIZE(HDRP(ptr));
+    size_t asize = adjust_size(size);
+    size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    size_t prev_size = GET_SIZE(FTRP(PREV_BLKP(ptr)));
+    void *prev_block = PREV_BLKP(ptr);
+    void *next_block = NEXT_BLKP(ptr);
+
+    do {
+        if (alloc_size == asize) {
+            return ptr;
+        }
+
+        if (alloc_size < asize) {
+            if (prev_alloc == ALLOC_BLK && next_alloc == ALLOC_BLK) {
+                break;
+            }
+
+            if (prev_alloc == ALLOC_BLK && next_alloc == FREE_BLK) {
+                if (next_size + alloc_size < asize) {
+                    break;
+                }
+
+                if (next_size + alloc_size - asize < 2 * DSIZE) {
+                    detach_free_list(NEXT_BLKP(ptr));
+                    PUT(HDRP(ptr), PACK(next_size + alloc_size, ALLOC_BLK));
+                    PUT(FTRP(ptr), PACK(next_size + alloc_size, ALLOC_BLK));
+                    return ptr;
+                }
+
+                detach_free_list(NEXT_BLKP(ptr));
+                PUT(HDRP(ptr), PACK(asize, ALLOC_BLK));
+                PUT(FTRP(ptr), PACK(asize, ALLOC_BLK));
+                PUT(HDRP(NEXT_BLKP(ptr)), PACK(next_size + alloc_size - asize, FREE_BLK));
+                PUT(FTRP(NEXT_BLKP(ptr)), PACK(next_size + alloc_size - asize, FREE_BLK));
+                coalesce(NEXT_BLKP(ptr));
+                return ptr;
+            }
+
+            if (prev_alloc == FREE_BLK && next_alloc == ALLOC_BLK) {
+                if (prev_size + alloc_size - asize < 2 * DSIZE) {
+                    detach_free_list(prev_block);
+                    memmove(prev_block, ptr, alloc_size - DSIZE);
+                    PUT(HDRP(prev_block), PACK(prev_size + alloc_size, ALLOC_BLK));
+                    PUT(FTRP(prev_block), PACK(prev_size + alloc_size, ALLOC_BLK));
+                    return prev_block;
+                }
+
+                detach_free_list(prev_block);
+                PUT(HDRP(prev_block), PACK(asize, ALLOC_BLK));
+                memmove(prev_block, ptr, alloc_size - DSIZE);
+                PUT(FTRP(prev_block), PACK(asize, ALLOC_BLK));
+                PUT(HDRP(NEXT_BLKP(prev_block)), PACK(prev_size + alloc_size - asize, FREE_BLK));
+                PUT(FTRP(NEXT_BLKP(prev_block)), PACK(prev_size + alloc_size - asize, FREE_BLK));
+                coalesce(NEXT_BLKP(prev_block));
+                return prev_block;
+            }
+
+            if (prev_alloc == FREE_BLK && next_alloc == FREE_BLK) {
+                detach_free_list(prev_block);
+                detach_free_list(next_block);
+                PUT(HDRP(prev_block), PACK(asize, ALLOC_BLK));
+                memmove(prev_block, ptr, alloc_size - DSIZE);
+                PUT(FTRP(prev_block), PACK(asize, ALLOC_BLK));
+                PUT(HDRP(NEXT_BLKP(prev_block)), PACK(alloc_size + prev_size + next_size - asize, FREE_BLK));
+                PUT(FTRP(NEXT_BLKP(prev_block)), PACK(alloc_size + prev_size + next_size - asize, FREE_BLK));
+                coalesce(NEXT_BLKP(prev_block));
+                return prev_block;
+            }
+        }
+
+        if (alloc_size > asize) {
+            if (alloc_size - asize >= 2 * DSIZE) {
+                PUT(HDRP(ptr), PACK(asize, ALLOC_BLK));
+                PUT(FTRP(ptr), PACK(asize, ALLOC_BLK));
+                PUT(HDRP(NEXT_BLKP(ptr)), PACK(alloc_size - asize, FREE_BLK));
+                PUT(FTRP(NEXT_BLKP(ptr)), PACK(alloc_size - asize, FREE_BLK));
+                coalesce(NEXT_BLKP(ptr));
+                return ptr;
+            }
+
+            return ptr;
+        }
+    } while (0);
+
     void *oldptr = ptr;
     void *newptr;
     size_t copySize;
@@ -325,4 +421,16 @@ static size_t asize_to_index(size_t asize) {
     }
 
     return index;
+}
+
+static size_t adjust_size(size_t size) {
+    size_t asize = size;
+
+    if (size <= DSIZE) {
+        asize = 2 * DSIZE;
+    } else {
+        asize = DSIZE * ((size + DSIZE + DSIZE - 1) / DSIZE);
+    }
+
+    return asize;
 }
