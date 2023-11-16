@@ -87,6 +87,13 @@ static void *attach_free_list(void *, size_t);
 static void *detach_free_list(void *);
 static size_t asize_to_index(size_t);
 static size_t adjust_size(size_t);
+static void *consume_prev_block(void *);
+static void *consume_next_block(void *);
+static void *consume_adjacent_block(void *, size_t);
+static void *divide_alloc_block(void *, size_t);
+static void *merge_and_divide_next_block(void *, size_t);
+static void *merge_and_divide_prev_block(void *, size_t);
+static void *alloc_copy_free(void *, size_t);
 
 /* Heap list */
 static void *heap_listp = NULL;
@@ -214,8 +221,6 @@ void *mm_realloc(void *ptr, size_t size) {
     size_t asize = adjust_size(size);
     size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
     size_t prev_size = GET_SIZE(FTRP(PREV_BLKP(ptr)));
-    void *prev_block = PREV_BLKP(ptr);
-    void *next_block = NEXT_BLKP(ptr);
 
     do {
         if (alloc_size == asize) {
@@ -232,80 +237,46 @@ void *mm_realloc(void *ptr, size_t size) {
                     break;
                 }
 
+                // 다음 블록이 너무 작다면 이전 블록을 흡수합니다.
                 if (next_size + alloc_size - asize < 2 * DSIZE) {
-                    detach_free_list(NEXT_BLKP(ptr));
-                    PUT(HDRP(ptr), PACK(next_size + alloc_size, ALLOC_BLK));
-                    PUT(FTRP(ptr), PACK(next_size + alloc_size, ALLOC_BLK));
-                    return ptr;
+                    return consume_next_block(ptr);
                 }
 
-                detach_free_list(NEXT_BLKP(ptr));
-                PUT(HDRP(ptr), PACK(asize, ALLOC_BLK));
-                PUT(FTRP(ptr), PACK(asize, ALLOC_BLK));
-                PUT(HDRP(NEXT_BLKP(ptr)), PACK(next_size + alloc_size - asize, FREE_BLK));
-                PUT(FTRP(NEXT_BLKP(ptr)), PACK(next_size + alloc_size - asize, FREE_BLK));
-                coalesce(NEXT_BLKP(ptr));
-                return ptr;
+                return merge_and_divide_next_block(ptr, asize);
             }
 
             if (prev_alloc == FREE_BLK && next_alloc == ALLOC_BLK) {
+                if (prev_size + alloc_size < asize) {
+                    break;
+                }
+                
+                // 만약 이전 블록이 너무 작다면 이전 블록을 흡수합니다.
                 if (prev_size + alloc_size - asize < 2 * DSIZE) {
-                    detach_free_list(prev_block);
-                    memmove(prev_block, ptr, alloc_size - DSIZE);
-                    PUT(HDRP(prev_block), PACK(prev_size + alloc_size, ALLOC_BLK));
-                    PUT(FTRP(prev_block), PACK(prev_size + alloc_size, ALLOC_BLK));
-                    return prev_block;
+                    return consume_prev_block(ptr);
                 }
 
-                detach_free_list(prev_block);
-                PUT(HDRP(prev_block), PACK(asize, ALLOC_BLK));
-                memmove(prev_block, ptr, alloc_size - DSIZE);
-                PUT(FTRP(prev_block), PACK(asize, ALLOC_BLK));
-                PUT(HDRP(NEXT_BLKP(prev_block)), PACK(prev_size + alloc_size - asize, FREE_BLK));
-                PUT(FTRP(NEXT_BLKP(prev_block)), PACK(prev_size + alloc_size - asize, FREE_BLK));
-                coalesce(NEXT_BLKP(prev_block));
-                return prev_block;
+                return merge_and_divide_prev_block(ptr, asize);
             }
 
             if (prev_alloc == FREE_BLK && next_alloc == FREE_BLK) {
-                detach_free_list(prev_block);
-                detach_free_list(next_block);
-                PUT(HDRP(prev_block), PACK(asize, ALLOC_BLK));
-                memmove(prev_block, ptr, alloc_size - DSIZE);
-                PUT(FTRP(prev_block), PACK(asize, ALLOC_BLK));
-                PUT(HDRP(NEXT_BLKP(prev_block)), PACK(alloc_size + prev_size + next_size - asize, FREE_BLK));
-                PUT(FTRP(NEXT_BLKP(prev_block)), PACK(alloc_size + prev_size + next_size - asize, FREE_BLK));
-                coalesce(NEXT_BLKP(prev_block));
-                return prev_block;
+                if (alloc_size + prev_size + next_size < asize) {
+                    break;
+                }
+
+                return consume_adjacent_block(ptr, asize);
             }
         }
 
         if (alloc_size > asize) {
             if (alloc_size - asize >= 2 * DSIZE) {
-                PUT(HDRP(ptr), PACK(asize, ALLOC_BLK));
-                PUT(FTRP(ptr), PACK(asize, ALLOC_BLK));
-                PUT(HDRP(NEXT_BLKP(ptr)), PACK(alloc_size - asize, FREE_BLK));
-                PUT(FTRP(NEXT_BLKP(ptr)), PACK(alloc_size - asize, FREE_BLK));
-                coalesce(NEXT_BLKP(ptr));
-                return ptr;
+                return divide_alloc_block(ptr, asize);
             }
 
             return ptr;
         }
     } while (0);
 
-    void *oldptr = ptr;
-    void *newptr;
-    size_t copySize;
-
-    newptr = mm_malloc(size);
-    if (newptr == NULL) return NULL;
-    // copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-    // if (size < copySize)
-    copySize = size;
-    memcpy(newptr, oldptr, copySize);
-    mm_free(oldptr);
-    return newptr;
+    return alloc_copy_free(ptr, size);
 }
 
 /*
@@ -433,4 +404,97 @@ static size_t adjust_size(size_t size) {
     }
 
     return asize;
+}
+
+static void *consume_prev_block(void *ptr) {
+    size_t alloc_size = GET_SIZE(HDRP(ptr));
+    size_t prev_size = GET_SIZE(FTRP(PREV_BLKP(ptr)));
+    void *prev_block = PREV_BLKP(ptr);
+    detach_free_list(prev_block);
+    memmove(prev_block, ptr, alloc_size - DSIZE);
+    PUT(HDRP(prev_block), PACK(prev_size + alloc_size, ALLOC_BLK));
+    PUT(FTRP(prev_block), PACK(prev_size + alloc_size, ALLOC_BLK));
+    return prev_block;
+}
+
+static void *consume_next_block(void *ptr) {
+    size_t alloc_size = GET_SIZE(HDRP(ptr));
+    size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    detach_free_list(NEXT_BLKP(ptr));
+    PUT(HDRP(ptr), PACK(next_size + alloc_size, ALLOC_BLK));
+    PUT(FTRP(ptr), PACK(next_size + alloc_size, ALLOC_BLK));
+    return ptr;
+}
+
+static void *consume_adjacent_block(void *ptr, size_t asize) {
+    size_t alloc_size = GET_SIZE(HDRP(ptr));
+    size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    size_t prev_size = GET_SIZE(FTRP(PREV_BLKP(ptr)));
+    void *prev_block = PREV_BLKP(ptr);
+    void *next_block = NEXT_BLKP(ptr);
+
+    detach_free_list(prev_block);
+    detach_free_list(next_block);
+    PUT(HDRP(prev_block), PACK(asize, ALLOC_BLK));
+    memmove(prev_block, ptr, alloc_size - DSIZE);
+    PUT(FTRP(prev_block), PACK(asize, ALLOC_BLK));
+    PUT(HDRP(NEXT_BLKP(prev_block)),
+        PACK(alloc_size + prev_size + next_size - asize, FREE_BLK));
+    PUT(FTRP(NEXT_BLKP(prev_block)),
+        PACK(alloc_size + prev_size + next_size - asize, FREE_BLK));
+    coalesce(NEXT_BLKP(prev_block));
+    return prev_block;
+}
+
+static void *divide_alloc_block(void* ptr, size_t asize) {
+    size_t alloc_size = GET_SIZE(HDRP(ptr));
+    PUT(HDRP(ptr), PACK(asize, ALLOC_BLK));
+    PUT(FTRP(ptr), PACK(asize, ALLOC_BLK));
+    PUT(HDRP(NEXT_BLKP(ptr)), PACK(alloc_size - asize, FREE_BLK));
+    PUT(FTRP(NEXT_BLKP(ptr)), PACK(alloc_size - asize, FREE_BLK));
+    coalesce(NEXT_BLKP(ptr));
+    return ptr;
+}
+
+static void *merge_and_divide_next_block(void *ptr, size_t asize) {
+    size_t alloc_size = GET_SIZE(HDRP(ptr));
+    size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    detach_free_list(NEXT_BLKP(ptr));
+    PUT(HDRP(ptr), PACK(asize, ALLOC_BLK));
+    PUT(FTRP(ptr), PACK(asize, ALLOC_BLK));
+    PUT(HDRP(NEXT_BLKP(ptr)), PACK(next_size + alloc_size - asize, FREE_BLK));
+    PUT(FTRP(NEXT_BLKP(ptr)), PACK(next_size + alloc_size - asize, FREE_BLK));
+    coalesce(NEXT_BLKP(ptr));
+    return ptr;
+}
+
+static void *merge_and_divide_prev_block(void *ptr, size_t asize) {
+    size_t alloc_size = GET_SIZE(HDRP(ptr));
+    size_t prev_size = GET_SIZE(FTRP(PREV_BLKP(ptr)));
+    void *prev_block = PREV_BLKP(ptr);
+    detach_free_list(prev_block);
+    PUT(HDRP(prev_block), PACK(asize, ALLOC_BLK));
+    memmove(prev_block, ptr, alloc_size - DSIZE);
+    PUT(FTRP(prev_block), PACK(asize, ALLOC_BLK));
+    PUT(HDRP(NEXT_BLKP(prev_block)),
+        PACK(prev_size + alloc_size - asize, FREE_BLK));
+    PUT(FTRP(NEXT_BLKP(prev_block)),
+        PACK(prev_size + alloc_size - asize, FREE_BLK));
+    coalesce(NEXT_BLKP(prev_block));
+    return prev_block;
+}
+
+static void *alloc_copy_free(void *ptr, size_t size) {
+    void *oldptr = ptr;
+    void *newptr;
+    size_t copySize;
+
+    newptr = mm_malloc(size);
+    if (newptr == NULL) return NULL;
+    // copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
+    // if (size < copySize)
+    copySize = size;
+    memcpy(newptr, oldptr, copySize);
+    mm_free(oldptr);
+    return newptr;
 }
